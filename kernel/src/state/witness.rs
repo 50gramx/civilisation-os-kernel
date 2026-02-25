@@ -262,6 +262,76 @@ impl StateWitnessBundle {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// apply_pool_mutations — Core State Transition Function
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Apply a sequence of authenticated leaf mutations to a Merkle pool root.
+///
+/// This is the constitutional bridge between witness types and state transition.
+/// It enforces **Model A (evolving-root verification)**: each mutation's path
+/// is verified against the root produced by the preceding mutation, not the
+/// original pool root.
+///
+/// # Constitutional Rules Enforced
+///
+/// 1. Mutations must be in **strictly ascending lexicographic key order**.
+///    Equal keys (duplicates) and reversed keys are both rejected.
+/// 2. Each mutation's path is verified against the **current intermediate root**,
+///    not `prev_state.<pool>_root`. The root evolves with every mutation.
+/// 3. The **final returned root** is the root reconstructed after the last mutation.
+///    The caller writes this into the new `EpochState`.
+/// 4. An empty mutation list is valid: returns `current_root` unchanged.
+///    This is the empty-epoch passthrough for pools with no activity.
+///
+/// # Errors
+///
+/// - `InvalidSerialization` — mutations are out of lexicographic key order,
+///   or contain duplicate keys.
+/// - `InvalidMerkleWitness` — any mutation's path does not verify against
+///   the current intermediate root.
+pub fn apply_pool_mutations(
+    current_root: Digest,
+    mutations: &[LeafMutation],
+) -> Result<Digest, TransitionError> {
+    // ── Step 1: Empty fast path ───────────────────────────────────────────────
+    // No mutations → root is unchanged. Valid for pools with no epoch activity.
+    if mutations.is_empty() {
+        return Ok(current_root);
+    }
+
+    // ── Step 2: Enforce strictly ascending key ordering ───────────────────────
+    // Keys must be strictly increasing (no duplicates, no reversal).
+    // This rule is from witness_schema.md §Witness Validity Invariants (4).
+    for i in 1..mutations.len() {
+        if mutations[i - 1].key >= mutations[i].key {
+            return Err(TransitionError::InvalidSerialization);
+        }
+    }
+
+    // ── Step 3: Evolving-root verification loop (Model A) ─────────────────────
+    let mut intermediate_root = current_root;
+
+    for mutation in mutations {
+        // 3a. Compute old leaf hash.
+        //     hash_leaf([]) == empty_tree_root() for INSERT case — correct by spec.
+        let old_leaf_hash = hash_leaf(&mutation.old_value);
+
+        // 3b. Verify the path against the CURRENT intermediate root, not the
+        //     original pool root. This enforces Model A: stale paths from
+        //     before a prior mutation fail here.
+        mutation.path.verify(old_leaf_hash, intermediate_root)?;
+
+        // 3c. Reconstruct the new intermediate root using the new leaf value.
+        let new_leaf_hash = hash_leaf(&mutation.new_value);
+        intermediate_root = mutation.path.reconstruct_root(new_leaf_hash);
+    }
+
+    // ── Step 4: Return the final root ─────────────────────────────────────────
+    // This is written directly into EpochState.<pool>_root by the caller.
+    Ok(intermediate_root)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
@@ -546,5 +616,145 @@ mod tests {
         ];
         assert_eq!(old_root, expected_old_root, "old_root diverged — hash_leaf or hash_node changed");
         assert_eq!(new_root, expected_new_root, "new_root diverged — Merkle mutation semantics changed");
+    }
+
+    // ── apply_pool_mutations ──────────────────────────────────────────────────
+
+    /// Build a single-level LeafMutation for a two-leaf tree.
+    /// Leaf is the LEFT child (key "a"), sibling is the RIGHT child (key "b").
+    fn make_mutation(
+        key: &[u8],
+        old_value: &[u8],
+        new_value: &[u8],
+        sibling: Digest,
+        position: NodePosition,
+    ) -> LeafMutation {
+        LeafMutation {
+            key: key.to_vec(),
+            old_value: old_value.to_vec(),
+            new_value: new_value.to_vec(),
+            path: MerklePath::new(vec![MerklePathNode { sibling, position }]).unwrap(),
+        }
+    }
+
+    #[test]
+    fn empty_mutations_returns_root_unchanged() {
+        let root = hash_node(&hash_leaf(b"a"), &hash_leaf(b"b"));
+        let result = apply_pool_mutations(root, &[]).unwrap();
+        assert_eq!(result, root, "empty mutation list must not change the root");
+    }
+
+    #[test]
+    fn single_mutation_produces_correct_new_root() {
+        // Tree: root = hash_node(A, B). Mutate A → A2.
+        let leaf_a = hash_leaf(b"a");
+        let leaf_b = hash_leaf(b"b");
+        let root = hash_node(&leaf_a, &leaf_b);
+
+        let mutations = vec![make_mutation(
+            b"a", b"a", b"a2", leaf_b, NodePosition::Left,
+        )];
+
+        let new_root = apply_pool_mutations(root, &mutations).unwrap();
+        let expected = hash_node(&hash_leaf(b"a2"), &leaf_b);
+        assert_eq!(new_root, expected);
+    }
+
+    #[test]
+    fn two_sequential_mutations_use_evolving_root_model_a() {
+        // Tree: root = hash_node(A, B). Apply two mutations in order:
+        //   1) A → A2  (key "a")
+        //   2) B → B2  (key "b"), path relative to intermediate root after mutation 1.
+        let leaf_a  = hash_leaf(b"a");
+        let leaf_b  = hash_leaf(b"b");
+        let leaf_a2 = hash_leaf(b"a2");
+        let leaf_b2 = hash_leaf(b"b2");
+
+        let original_root = hash_node(&leaf_a, &leaf_b);
+        // After mutation 1: intermediate = hash_node(A2, B)
+        let intermediate  = hash_node(&leaf_a2, &leaf_b);
+
+        // Mutation 1: A → A2, path relative to original_root.
+        let m1 = make_mutation(b"a", b"a", b"a2", leaf_b, NodePosition::Left);
+        // Mutation 2: B → B2, path relative to intermediate (Model A).
+        let m2 = make_mutation(b"b", b"b", b"b2", leaf_a2, NodePosition::Right);
+
+        let final_root = apply_pool_mutations(original_root, &[m1, m2]).unwrap();
+        let expected   = hash_node(&leaf_a2, &leaf_b2);
+        assert_eq!(final_root, expected,
+            "two sequential mutations must produce hash_node(A2, B2)");
+
+        // PINNED CONSTITUTIONAL VECTOR — DO NOT CHANGE.
+        // Tree hash_node(A, B). Apply A→A2 then B→B2 via Model A evolving root.
+        // Final root = hash_node(hash_leaf("a2"), hash_leaf("b2"))
+        // = 079161dd45f4653477aac13c77f7a034300c61f3fb8627ebecdee87d86f83018
+        // Any change to apply_pool_mutations, hash_leaf, hash_node, or
+        // NodePosition semantics will break this assertion immediately.
+        let expected_final_root: [u8; 32] = [
+            0x07, 0x91, 0x61, 0xdd, 0x45, 0xf4, 0x65, 0x34,
+            0x77, 0xaa, 0xc1, 0x3c, 0x77, 0xf7, 0xa0, 0x34,
+            0x30, 0x0c, 0x61, 0xf3, 0xfb, 0x86, 0x27, 0xeb,
+            0xec, 0xde, 0xe8, 0x7d, 0x86, 0xf8, 0x30, 0x18,
+        ];
+        assert_eq!(final_root, expected_final_root,
+            "two-mutation final root diverged — apply_pool_mutations execution path changed");
+    }
+
+    #[test]
+    fn duplicate_key_is_rejected() {
+        let leaf_a = hash_leaf(b"a");
+        let leaf_b = hash_leaf(b"b");
+        let root   = hash_node(&leaf_a, &leaf_b);
+
+        // Same key "a" twice — must be rejected.
+        let m1 = make_mutation(b"a", b"a", b"a2", leaf_b, NodePosition::Left);
+        let m2 = make_mutation(b"a", b"a2", b"a3", leaf_b, NodePosition::Left);
+
+        assert_eq!(
+            apply_pool_mutations(root, &[m1, m2]),
+            Err(TransitionError::InvalidSerialization),
+            "duplicate key must be rejected"
+        );
+    }
+
+    #[test]
+    fn reversed_key_order_is_rejected() {
+        let leaf_a = hash_leaf(b"a");
+        let leaf_b = hash_leaf(b"b");
+        let root   = hash_node(&leaf_a, &leaf_b);
+
+        // Correct mutations but submitted in wrong order (b before a).
+        let m_b = make_mutation(b"b", b"b", b"b2", leaf_a, NodePosition::Right);
+        let m_a = make_mutation(b"a", b"a", b"a2", leaf_b, NodePosition::Left);
+
+        assert_eq!(
+            apply_pool_mutations(root, &[m_b, m_a]),
+            Err(TransitionError::InvalidSerialization),
+            "reversed key order must be rejected"
+        );
+    }
+
+    #[test]
+    fn stale_path_fails_on_second_mutation_model_a_enforced() {
+        // Tree: root = hash_node(A, B).
+        // Both mutations have paths relative to the ORIGINAL root (Model B style).
+        // The second mutation must fail because its path is stale after mutation 1.
+        let leaf_a  = hash_leaf(b"a");
+        let leaf_b  = hash_leaf(b"b");
+        let root    = hash_node(&leaf_a, &leaf_b);
+
+        // Both paths reference the original sibling (stale after mutation 1).
+        let m1 = make_mutation(b"a", b"a", b"a2", leaf_b, NodePosition::Left);
+        // m2's path sibling is still leaf_a (original), but after m1, the tree
+        // has leaf_a2 on the left — so the reconstructed root from m1 will differ.
+        let m2 = make_mutation(b"b", b"b", b"b2", leaf_a, NodePosition::Right);
+
+        // m2 must fail: its path (sibling = leaf_a) verifies against
+        // hash_node(leaf_a2, leaf_b), not hash_node(leaf_a, leaf_b).
+        assert_eq!(
+            apply_pool_mutations(root, &[m1, m2]),
+            Err(TransitionError::InvalidMerkleWitness),
+            "stale path from before a prior mutation must fail (Model A enforced)"
+        );
     }
 }
