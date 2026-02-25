@@ -1,0 +1,137 @@
+name: Constitutional Kernel CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+# Only one run per branch/PR at a time. New pushes cancel in-flight runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Job 1: Debug build ─────────────────────────────────────────────────────
+  # Rust debug mode enables overflow-checks by default.
+  # The constitutional test vectors must pass in debug mode.
+  # A failure here means arithmetic overflow behavior diverges from release.
+  test-debug:
+    name: Tests (debug)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: kernel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.1"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            kernel/target
+          key: ${{ runner.os }}-cargo-debug-${{ hashFiles('kernel/Cargo.lock') }}
+
+      - name: cargo test (debug)
+        run: cargo test --locked 2>&1
+
+  # ── Job 2: Release build ───────────────────────────────────────────────────
+  # Release mode uses optimized codegen. The pinned constitutional vectors
+  # must be identical to debug output. Any divergence is a critical failure.
+  test-release:
+    name: Tests (release)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: kernel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.1"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            kernel/target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('kernel/Cargo.lock') }}
+
+      - name: cargo test --release
+        run: cargo test --release --locked 2>&1
+
+  # ── Job 3: WASM build ──────────────────────────────────────────────────────
+  # Verifies the kernel compiles to a valid WASM artifact.
+  # In a future step this job will also hash the .wasm output and assert
+  # it matches a pinned known-good value (binary reproducibility).
+  build-wasm:
+    name: WASM Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: kernel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain + WASM target
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.1"
+          targets: "wasm32-unknown-unknown"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            kernel/target
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('kernel/Cargo.lock') }}
+
+      - name: cargo build --target wasm32-unknown-unknown --release
+        run: cargo build --target wasm32-unknown-unknown --release --locked 2>&1
+
+      # Future (v0.0.2): pin WASM SHA-256 and assert here.
+      # - name: Assert WASM binary hash
+      #   run: |
+      #     WASM_HASH=$(sha256sum target/wasm32-unknown-unknown/release/civilisation_os_kernel.wasm | cut -d' ' -f1)
+      #     EXPECTED="<pinned hash here>"
+      #     if [ "$WASM_HASH" != "$EXPECTED" ]; then
+      #       echo "WASM binary hash mismatch: $WASM_HASH != $EXPECTED"
+      #       exit 1
+      #     fi
+
+  # ── Job 4: Lockfile check ──────────────────────────────────────────────────
+  # Cargo.lock must be committed and up to date.
+  # Prevents silent dependency version drift between contributors.
+  lockfile:
+    name: Lockfile integrity
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: kernel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.1"
+
+      - name: cargo update --locked (must not modify lockfile)
+        run: cargo update --locked 2>&1

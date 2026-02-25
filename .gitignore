@@ -1,0 +1,18 @@
+# Build output — never commit
+/target
+kernel/target
+
+# WASM artifacts — pinned hash goes in release notes, not in repo
+*.wasm
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor state
+.vscode/
+.idea/
+
+# NOTE: Cargo.lock IS committed.
+# The CI workflow uses --locked on all commands.
+# Committing Cargo.lock is required for reproducible builds.

@@ -1,0 +1,32 @@
+[package]
+name = "civilisation-os-kernel"
+version = "0.0.0-draft"
+edition = "2021"
+authors = ["50gramx Foundation"]
+description = "The deterministic state transition kernel for Civilisation OS. Consensus-critical. Open source."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/50gramx/civilisation-os-kernel"
+
+# This crate compiles to both native (for tests) and wasm32-unknown-unknown.
+# No std — allocator is provided by the host embedder in WASM environments.
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+# Zero external dependencies. All cryptographic primitives implemented inline.
+# Supply chain is fully auditable within this repository alone.
+
+[dev-dependencies]
+# Test harness only — std is permitted behind cfg(test).
+
+[features]
+# No features — feature flags that alter consensus behavior are constitutionally forbidden.
+# Feature flags that change execution semantics create invisible fork vectors.
+
+[profile.release]
+# Reproducible builds: panic=abort eliminates unwinding infrastructure variance.
+# This also produces smaller WASM artifacts.
+panic = "abort"
+opt-level = "z"
+lto = true
+codegen-units = 1
