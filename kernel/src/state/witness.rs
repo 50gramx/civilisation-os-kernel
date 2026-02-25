@@ -1,0 +1,550 @@
+//! `StateWitnessBundle` — Host ↔ Kernel trust boundary types.
+//!
+//! Implements the data structures defined in `docs/specs/witness_schema.md`.
+//! All field names, ordering rules, and size constraints are cross-verified
+//! against that document. Any divergence from the spec is a protocol bug.
+//!
+//! # Position Semantics (read carefully)
+//!
+//! `NodePosition::Left` means the CURRENT node is the LEFT child.
+//! Therefore: `parent = hash_node(current, sibling)`.
+//!
+//! `NodePosition::Right` means the CURRENT node is the RIGHT child.
+//! Therefore: `parent = hash_node(sibling, current)`.
+//!
+//! This matches `witness_schema.md §Verification Algorithm` exactly.
+//! The mnemonic: the position names WHERE the current node sits, not where
+//! the sibling sits.
+//!
+//! # Evolving Root Model (Model A — Constitutional)
+//!
+//! When multiple `LeafMutation` entries modify the same pool:
+//! - The first mutation's path verifies against `prev_state.<pool>_root`.
+//! - Each subsequent mutation's path verifies against the root produced
+//!   by the preceding mutation's `reconstruct_root()`.
+//! - The host is responsible for constructing paths relative to intermediate
+//!   roots. Model B (paths relative to original root) is rejected.
+
+use crate::TransitionError;
+use crate::physics::hashing::{Digest, hash_leaf, hash_node};
+use crate::physics::merkle::MAX_MERKLE_DEPTH;
+use crate::state::epoch::MAX_PAYLOADS_PER_EPOCH;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Constitutional constants
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Maximum byte length of a leaf mutation key.
+/// From `witness_schema.md §Size Limits`.
+pub const MAX_KEY_BYTES: usize = 64;
+
+/// Maximum byte length of a leaf mutation value (old or new).
+/// From `witness_schema.md §Size Limits`.
+pub const MAX_VALUE_BYTES: usize = 4096;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// NodePosition
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Which side of its parent the CURRENT node occupies.
+///
+/// `Left`  → current is left child  → `parent = hash_node(current, sibling)`
+/// `Right` → current is right child → `parent = hash_node(sibling, current)`
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodePosition {
+    Left,
+    Right,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// MerklePathNode
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// One level in a Merkle authentication path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MerklePathNode {
+    /// The sibling's SHA-256 hash at this level.
+    pub sibling: Digest,
+    /// Which side the CURRENT node occupies at this level.
+    pub position: NodePosition,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// MerklePath
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// An authentication path from a leaf to the Merkle root.
+///
+/// `nodes[0]` is closest to the leaf; `nodes[len-1]` is closest to the root.
+/// Maximum length: `MAX_MERKLE_DEPTH` (40). Construction fails beyond this.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MerklePath {
+    pub nodes: Vec<MerklePathNode>,
+}
+
+impl MerklePath {
+    /// Construct a path, enforcing the depth limit immediately.
+    pub fn new(nodes: Vec<MerklePathNode>) -> Result<Self, TransitionError> {
+        if nodes.len() > MAX_MERKLE_DEPTH {
+            return Err(TransitionError::InvalidMerkleWitness);
+        }
+        Ok(Self { nodes })
+    }
+
+    /// Verify that walking this path from `leaf_hash` reaches `expected_root`.
+    ///
+    /// Returns `Err(InvalidMerkleWitness)` if the derived root does not match.
+    /// This is the primary authentication step for CURRENT leaf state.
+    pub fn verify(
+        &self,
+        leaf_hash: Digest,
+        expected_root: Digest,
+    ) -> Result<(), TransitionError> {
+        if self.walk(leaf_hash) != expected_root {
+            Err(TransitionError::InvalidMerkleWitness)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Walk this path with a NEW leaf hash to derive the new root after mutation.
+    ///
+    /// Uses the same sibling set as `verify()` — the path structure is shared.
+    /// The caller must have already called `verify(old_leaf_hash, current_root)`
+    /// before calling this; `reconstruct_root` does not re-verify.
+    pub fn reconstruct_root(&self, new_leaf_hash: Digest) -> Digest {
+        self.walk(new_leaf_hash)
+    }
+
+    /// Internal: walk the path from `start` to the root using stored siblings.
+    fn walk(&self, start: Digest) -> Digest {
+        let mut current = start;
+        for node in &self.nodes {
+            current = match node.position {
+                // Current is LEFT child: parent = hash_node(current, sibling)
+                NodePosition::Left  => hash_node(&current, &node.sibling),
+                // Current is RIGHT child: parent = hash_node(sibling, current)
+                NodePosition::Right => hash_node(&node.sibling, &current),
+            };
+        }
+        current
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// LeafMutation
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// A single authenticated leaf update in a Merkle pool.
+///
+/// Field names and size limits from `witness_schema.md §Struct Layout`.
+/// On-wire, `key` must be the canonical JCS-encoded identifier for this entry.
+/// The kernel extracts the key field from `old_value` and asserts it matches
+/// `LeafMutation.key` before accepting the path (Gap 1 invariant).
+#[derive(Clone, Debug)]
+pub struct LeafMutation {
+    /// Canonical identifier for this leaf (JCS-encoded key, ≤ MAX_KEY_BYTES).
+    /// For validator set: lowercase hex of Ed25519 public key.
+    /// For impact pool: lowercase hex of SHA-256 of ProofOfImpact canonical bytes.
+    /// For bond pool: lowercase hex of SHA-256 of VouchBond canonical bytes.
+    pub key: Vec<u8>,
+
+    /// Canonical bytes of the leaf value BEFORE this mutation.
+    /// Empty (`[]`) means this is an INSERT (leaf did not previously exist).
+    /// In that case: `hash_leaf([]) == empty_tree_root()` — both equal SHA256([0x00]).
+    pub old_value: Vec<u8>,
+
+    /// Canonical bytes of the leaf value AFTER this mutation.
+    /// Empty (`[]`) means this is a DELETE (validator withdrawal only in v0.0.2).
+    pub new_value: Vec<u8>,
+
+    /// Authentication path for this leaf, relative to the EVOLVING pool root
+    /// (Model A). The host constructs this path accounting for all prior
+    /// mutations that have already been applied to this pool in this epoch.
+    pub path: MerklePath,
+}
+
+impl LeafMutation {
+    /// Validate all size constraints.
+    /// Does NOT verify the Merkle path — call `path.verify()` separately.
+    pub fn validate_sizes(&self) -> Result<(), TransitionError> {
+        if self.key.is_empty() || self.key.len() > MAX_KEY_BYTES {
+            return Err(TransitionError::InvalidSerialization);
+        }
+        if self.old_value.len() > MAX_VALUE_BYTES {
+            return Err(TransitionError::InvalidSerialization);
+        }
+        if self.new_value.len() > MAX_VALUE_BYTES {
+            return Err(TransitionError::InvalidSerialization);
+        }
+        Ok(())
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// EntropyStats
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Aggregate statistics for entropy metric computation.
+///
+/// Field names match `witness_schema.md §EntropyStats` and `state/entropy.rs`.
+/// This is the ONLY acknowledged host-trust surface in v0.0.2 — the kernel
+/// cannot independently verify `total_supply_raw` or `unique_active_validators`
+/// without O(N) witnesses spanning the entire validator set.
+///
+/// The kernel verifies: `active_bonded_magnitude_raw ≤ total_supply_raw`
+/// and `optimal_validator_count > 0`. All other values are host-trusted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntropyStats {
+    /// Sum of all active VouchBond magnitudes this epoch (raw `Fixed` inner u128).
+    pub active_bonded_magnitude_raw: u128,
+    /// Total circulating supply at epoch start (raw `Fixed` inner u128).
+    pub total_supply_raw: u128,
+    /// Count of unique validators that submitted ≥ 1 payload this epoch.
+    pub unique_active_validators: u64,
+    /// Target validator set size from the Genesis Manifest (must be > 0).
+    pub optimal_validator_count: u64,
+}
+
+impl EntropyStats {
+    /// Validate the internally-checkable constraints.
+    pub fn validate(&self) -> Result<(), TransitionError> {
+        // Bonded amount cannot exceed total supply.
+        if self.active_bonded_magnitude_raw > self.total_supply_raw {
+            return Err(TransitionError::MathOverflow);
+        }
+        // Optimal count of zero would cause DivisionByZero in entropy computation.
+        if self.optimal_validator_count == 0 {
+            return Err(TransitionError::DivisionByZero);
+        }
+        Ok(())
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// StateWitnessBundle
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Everything the host provides for one epoch transition.
+///
+/// Field names are alphabetical (JCS canonical order for eventual serialization)
+/// and match the three Merkle pool roots in `EpochState`:
+/// `bond_pool_root`, `impact_pool_root`, `validator_set_root`.
+///
+/// Within each `Vec<LeafMutation>`, entries MUST be in strictly ascending
+/// lexicographic order of `key`. The kernel rejects out-of-order witnesses.
+/// No key may appear in more than one pool's array.
+#[derive(Clone, Debug)]
+pub struct StateWitnessBundle {
+    /// Witness mutations for the bond pool tree (`EpochState.bond_pool_root`).
+    pub bond_witnesses: Vec<LeafMutation>,
+    /// Aggregate entropy statistics (partially host-trusted — see EntropyStats).
+    pub entropy_stats: EntropyStats,
+    /// Witness mutations for the impact pool tree (`EpochState.impact_pool_root`).
+    pub impact_witnesses: Vec<LeafMutation>,
+    /// Witness mutations for the validator set tree (`EpochState.validator_set_root`).
+    /// Processed in two passes: registration first, then decay.
+    pub validator_witnesses: Vec<LeafMutation>,
+}
+
+impl StateWitnessBundle {
+    /// Validate the combined payload count against `MAX_PAYLOADS_PER_EPOCH`.
+    /// Called before any Merkle verification — reject oversized bundles immediately.
+    pub fn validate_limits(&self) -> Result<(), TransitionError> {
+        let total = self.bond_witnesses.len()
+            .saturating_add(self.impact_witnesses.len())
+            .saturating_add(self.validator_witnesses.len());
+        if total > MAX_PAYLOADS_PER_EPOCH {
+            return Err(TransitionError::PayloadLimitExceeded);
+        }
+        Ok(())
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests
+// ──────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::physics::hashing::{hash_leaf, hash_node};
+    use crate::physics::merkle::empty_tree_root;
+
+    // ── Position semantics ────────────────────────────────────────────────────
+
+    #[test]
+    fn left_position_means_current_is_left_child() {
+        // Tree:  root
+        //        /  \
+        //    leaf    sibling
+        // parent = hash_node(leaf, sibling)  [leaf is LEFT child]
+        let leaf    = hash_leaf(b"a");
+        let sibling = hash_leaf(b"b");
+        let expected_root = hash_node(&leaf, &sibling);
+
+        let path = MerklePath::new(vec![MerklePathNode {
+            sibling,
+            position: NodePosition::Left, // current (leaf) is LEFT
+        }]).unwrap();
+
+        path.verify(leaf, expected_root).unwrap();
+    }
+
+    #[test]
+    fn right_position_means_current_is_right_child() {
+        // Tree:  root
+        //        /  \
+        //    sibling  leaf
+        // parent = hash_node(sibling, leaf)  [leaf is RIGHT child]
+        let sibling = hash_leaf(b"a");
+        let leaf    = hash_leaf(b"b");
+        let expected_root = hash_node(&sibling, &leaf);
+
+        let path = MerklePath::new(vec![MerklePathNode {
+            sibling,
+            position: NodePosition::Right, // current (leaf) is RIGHT
+        }]).unwrap();
+
+        path.verify(leaf, expected_root).unwrap();
+    }
+
+    // ── Empty path (single-leaf tree) ─────────────────────────────────────────
+
+    #[test]
+    fn empty_path_verifies_single_leaf_tree() {
+        // A tree with exactly one leaf: root == hash_leaf(value).
+        // No siblings exist, so path is empty.
+        let leaf_value = b"single";
+        let leaf_hash  = hash_leaf(leaf_value);
+
+        let path = MerklePath::new(vec![]).unwrap();
+        path.verify(leaf_hash, leaf_hash).unwrap();
+    }
+
+    // ── reconstruct_root ──────────────────────────────────────────────────────
+
+    #[test]
+    fn reconstruct_root_produces_new_root_after_mutation() {
+        // Tree:  root
+        //        /  \
+        //       A    B
+        let leaf_a = hash_leaf(b"a");
+        let leaf_b = hash_leaf(b"b");
+        let root   = hash_node(&leaf_a, &leaf_b);
+
+        let path = MerklePath::new(vec![MerklePathNode {
+            sibling:  leaf_b,
+            position: NodePosition::Left, // A is the left child
+        }]).unwrap();
+
+        // Verify A is in tree at root.
+        path.verify(leaf_a, root).unwrap();
+
+        // Mutate: replace A with A2.
+        let leaf_a2   = hash_leaf(b"a2");
+        let new_root  = path.reconstruct_root(leaf_a2);
+        let expected  = hash_node(&leaf_a2, &leaf_b);
+        assert_eq!(new_root, expected);
+    }
+
+    // ── Wrong root rejected ───────────────────────────────────────────────────
+
+    #[test]
+    fn wrong_expected_root_is_rejected() {
+        let leaf = hash_leaf(b"x");
+        let path = MerklePath::new(vec![]).unwrap();
+        assert_eq!(
+            path.verify(leaf, [0u8; 32]),
+            Err(TransitionError::InvalidMerkleWitness)
+        );
+    }
+
+    #[test]
+    fn wrong_sibling_produces_different_root() {
+        let leaf    = hash_leaf(b"a");
+        let sibling = hash_leaf(b"b");
+        let root    = hash_node(&leaf, &sibling);
+
+        // Path with wrong sibling.
+        let bad_path = MerklePath::new(vec![MerklePathNode {
+            sibling:  hash_leaf(b"WRONG"),
+            position: NodePosition::Left,
+        }]).unwrap();
+
+        assert_eq!(
+            bad_path.verify(leaf, root),
+            Err(TransitionError::InvalidMerkleWitness)
+        );
+    }
+
+    // ── Depth limit ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn path_at_depth_limit_is_accepted() {
+        let nodes = vec![
+            MerklePathNode { sibling: [0u8; 32], position: NodePosition::Left };
+            MAX_MERKLE_DEPTH
+        ];
+        assert!(MerklePath::new(nodes).is_ok());
+    }
+
+    #[test]
+    fn path_exceeding_depth_limit_is_rejected() {
+        let nodes = vec![
+            MerklePathNode { sibling: [0u8; 32], position: NodePosition::Left };
+            MAX_MERKLE_DEPTH + 1
+        ];
+        assert_eq!(
+            MerklePath::new(nodes),
+            Err(TransitionError::InvalidMerkleWitness)
+        );
+    }
+
+    // ── Empty leaf identity (constitutional) ──────────────────────────────────
+
+    #[test]
+    fn hash_leaf_empty_equals_empty_tree_root() {
+        // CONSTITUTIONAL: hash_leaf([]) == empty_tree_root()
+        // Both = SHA256([0x00]). Frozen by witness_schema.md.
+        // Breaking this identity is a fork.
+        assert_eq!(hash_leaf(b""), empty_tree_root(),
+            "hash_leaf([]) must equal empty_tree_root() — both are SHA256([0x00])");
+    }
+
+    // ── EntropyStats validation ───────────────────────────────────────────────
+
+    #[test]
+    fn entropy_stats_rejects_bonded_exceeding_supply() {
+        let bad = EntropyStats {
+            active_bonded_magnitude_raw: 1001,
+            total_supply_raw: 1000,
+            unique_active_validators: 10,
+            optimal_validator_count: 100,
+        };
+        assert_eq!(bad.validate(), Err(TransitionError::MathOverflow));
+    }
+
+    #[test]
+    fn entropy_stats_rejects_zero_optimal_count() {
+        let bad = EntropyStats {
+            active_bonded_magnitude_raw: 0,
+            total_supply_raw: 1000,
+            unique_active_validators: 10,
+            optimal_validator_count: 0,
+        };
+        assert_eq!(bad.validate(), Err(TransitionError::DivisionByZero));
+    }
+
+    #[test]
+    fn entropy_stats_accepts_bonded_equal_to_supply() {
+        let ok = EntropyStats {
+            active_bonded_magnitude_raw: 1000,
+            total_supply_raw: 1000,
+            unique_active_validators: 10,
+            optimal_validator_count: 100,
+        };
+        assert!(ok.validate().is_ok());
+    }
+
+    // ── StateWitnessBundle payload limit ──────────────────────────────────────
+
+    #[test]
+    fn bundle_over_payload_limit_is_rejected() {
+        let dummy_mutation = LeafMutation {
+            key: b"k".to_vec(),
+            old_value: vec![],
+            new_value: b"v".to_vec(),
+            path: MerklePath::new(vec![]).unwrap(),
+        };
+        // MAX_PAYLOADS_PER_EPOCH + 1 total across all pools.
+        let bundle = StateWitnessBundle {
+            bond_witnesses: vec![dummy_mutation.clone(); MAX_PAYLOADS_PER_EPOCH / 2 + 1],
+            entropy_stats: EntropyStats {
+                active_bonded_magnitude_raw: 0,
+                total_supply_raw: 1,
+                unique_active_validators: 1,
+                optimal_validator_count: 1,
+            },
+            impact_witnesses: vec![dummy_mutation; MAX_PAYLOADS_PER_EPOCH / 2 + 1],
+            validator_witnesses: vec![],
+        };
+        assert_eq!(bundle.validate_limits(), Err(TransitionError::PayloadLimitExceeded));
+    }
+
+    // ── LeafMutation size validation ──────────────────────────────────────────
+
+    #[test]
+    fn leaf_mutation_rejects_empty_key() {
+        let m = LeafMutation {
+            key: vec![],
+            old_value: vec![],
+            new_value: vec![],
+            path: MerklePath::new(vec![]).unwrap(),
+        };
+        assert_eq!(m.validate_sizes(), Err(TransitionError::InvalidSerialization));
+    }
+
+    #[test]
+    fn leaf_mutation_rejects_oversized_value() {
+        let m = LeafMutation {
+            key: b"k".to_vec(),
+            old_value: vec![0u8; MAX_VALUE_BYTES + 1],
+            new_value: vec![],
+            path: MerklePath::new(vec![]).unwrap(),
+        };
+        assert_eq!(m.validate_sizes(), Err(TransitionError::InvalidSerialization));
+    }
+
+    // ── Pinned constitutional vector ──────────────────────────────────────────
+
+    #[test]
+    fn two_leaf_mutation_verify_and_reconstruct_is_pinned() {
+        // CONSTITUTIONAL VECTOR — DO NOT CHANGE.
+        //
+        // Tree (two leaves):
+        //     root = hash_node(hash_leaf(b"a"), hash_leaf(b"b"))
+        //
+        // Mutation: replace leaf "a" with "a2".
+        // New root = hash_node(hash_leaf(b"a2"), hash_leaf(b"b"))
+        //
+        // Leaf "a" is the LEFT child (position = Left).
+        // Leaf "b" is the sibling on the RIGHT.
+        let leaf_a  = hash_leaf(b"a");
+        let leaf_b  = hash_leaf(b"b");
+        let old_root = hash_node(&leaf_a, &leaf_b);
+
+        let path = MerklePath::new(vec![MerklePathNode {
+            sibling:  leaf_b,
+            position: NodePosition::Left,
+        }]).unwrap();
+
+        // Verify old leaf sits in old root.
+        path.verify(leaf_a, old_root).unwrap();
+
+        // Reconstruct new root after mutation.
+        let leaf_a2  = hash_leaf(b"a2");
+        let new_root = path.reconstruct_root(leaf_a2);
+        let expected = hash_node(&leaf_a2, &leaf_b);
+        assert_eq!(new_root, expected,
+            "two-leaf mutation must produce the correct new root");
+
+        // PINNED CONSTITUTIONAL VECTOR — DO NOT CHANGE.
+        // old_root = hash_node(hash_leaf("a"), hash_leaf("b"))
+        // new_root = hash_node(hash_leaf("a2"), hash_leaf("b"))
+        // Any change to hash_leaf, hash_node, or NodePosition semantics breaks this.
+        let expected_old_root: [u8; 32] = [
+            0xb1, 0x37, 0x98, 0x5f, 0xf4, 0x84, 0xfb, 0x60,
+            0x0d, 0xb9, 0x31, 0x07, 0xc7, 0x7b, 0x03, 0x65,
+            0xc8, 0x0d, 0x78, 0xf5, 0xb4, 0x29, 0xde, 0xd0,
+            0xfd, 0x97, 0x36, 0x1d, 0x07, 0x79, 0x99, 0xeb,
+        ];
+        let expected_new_root: [u8; 32] = [
+            0xce, 0x09, 0x3f, 0x77, 0xc5, 0x46, 0x7d, 0x40,
+            0x5c, 0x9e, 0xe9, 0xdb, 0xbd, 0xd8, 0x07, 0x85,
+            0x02, 0x99, 0x3e, 0x9b, 0x6f, 0xc8, 0x47, 0x6e,
+            0x31, 0xed, 0x7c, 0x69, 0x57, 0xcd, 0xaf, 0xcb,
+        ];
+        assert_eq!(old_root, expected_old_root, "old_root diverged — hash_leaf or hash_node changed");
+        assert_eq!(new_root, expected_new_root, "new_root diverged — Merkle mutation semantics changed");
+    }
+}
