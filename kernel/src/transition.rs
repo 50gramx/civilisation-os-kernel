@@ -49,6 +49,7 @@
 use crate::TransitionError;
 use crate::physics::hashing::Digest;
 use crate::state::epoch::{EpochState, MAX_PAYLOADS_PER_EPOCH};
+use crate::state::witness::StateWitnessBundle;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Public API
@@ -131,6 +132,127 @@ pub fn apply_epoch_dry_run(
         kernel_hash,
         previous_root:         new_previous_root,
         state_root:            [0u8; 32], // will be overwritten by commit()
+        validator_set_root:    new_validator_set_root,
+        vdf_challenge_seed:    new_vdf_challenge_seed,
+    };
+
+    new_state.commit()
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// apply_epoch — v0.0.2 Constitutional State Transition
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Advance one epoch using an authenticated `StateWitnessBundle`.
+///
+/// This replaces the dry-run stubs in `apply_epoch_dry_run` with:
+/// - Real Merkle pool mutations (Model A evolving-root verification)
+/// - Real entropy computation from host-provided aggregate statistics
+///
+/// `apply_epoch_dry_run` is retained as the v0.0.1 constitutional baseline.
+///
+/// # Pool Isolation (Constitutional)
+///
+/// Each pool is a sealed universe. The three calls are independent:
+/// - `validator_witnesses` → `validator_set_root` only
+/// - `impact_witnesses` → `impact_pool_root` only
+/// - `bond_witnesses` → `bond_pool_root` only
+///
+/// Keys do not cross pool boundaries. Paths do not cross pool boundaries.
+/// Mutations do not cross pool boundaries. Failures do not cross pool boundaries.
+///
+/// # Arguments
+///
+/// - `prev`: The committed state of the preceding epoch.
+/// - `witness`: All pool mutations + entropy statistics for this epoch.
+/// - `kernel_hash`: SHA-256 of the WASM kernel binary executing this transition.
+///
+/// # Returns
+///
+/// A new `EpochState` with:
+/// - `epoch_number` = prev + 1
+/// - `previous_root` = prev.state_root
+/// - All three Merkle pool roots updated via witness-authenticated mutations
+/// - `entropy_metric_scaled` computed from witness entropy stats
+/// - `state_root` = SHA256(canonical JSON of all other fields)
+/// - `vdf_challenge_seed` = all zeros (stub until v0.1.0)
+pub fn apply_epoch(
+    prev:        &EpochState,
+    witness:     &StateWitnessBundle,
+    kernel_hash: Digest,
+) -> Result<EpochState, TransitionError> {
+    use crate::math::fixed::Fixed;
+    use crate::state::entropy::compute_entropy;
+    use crate::state::witness::apply_pool_mutations;
+
+    // ── Step 1: Validate bundle size limits ───────────────────────────────────
+    // Reject oversized bundles before touching any Merkle state.
+    witness.validate_limits()?;
+
+    // ── Step 2: Validate entropy stats ────────────────────────────────────────
+    // Entropy must be internally consistent before any pool is touched.
+    // A failed entropy check aborts the epoch with no partial state mutation.
+    witness.entropy_stats.validate()?;
+
+    // ── Step 3: Epoch number (checked increment) ──────────────────────────────
+    let new_epoch_number = prev
+        .epoch_number
+        .checked_add(1)
+        .ok_or(TransitionError::MathOverflow)?;
+
+    // ── Step 4: Chain the previous state root ─────────────────────────────────
+    let new_previous_root = prev.state_root;
+
+    // ── Step 5: Validator pool (registration + decay pass) ────────────────────
+    // validator_witnesses covers both registration and decay mutations.
+    // Within the array, registration mutations come first (lower keys),
+    // decay mutations after; lexicographic order is enforced by apply_pool_mutations.
+    let new_validator_set_root = apply_pool_mutations(
+        prev.validator_set_root,
+        &witness.validator_witnesses,
+    )?;
+
+    // ── Step 6: Impact pool ───────────────────────────────────────────────────
+    let new_impact_pool_root = apply_pool_mutations(
+        prev.impact_pool_root,
+        &witness.impact_witnesses,
+    )?;
+
+    // ── Step 7: Bond pool ─────────────────────────────────────────────────────
+    let new_bond_pool_root = apply_pool_mutations(
+        prev.bond_pool_root,
+        &witness.bond_witnesses,
+    )?;
+
+    // ── Step 8: Entropy computation ───────────────────────────────────────────
+    // Convert raw u128 fields to Fixed and delegate to compute_entropy().
+    // If total_supply is zero, compute_entropy returns DivisionByZero.
+    // EntropyStats.validate() already ensures optimal_validator_count > 0.
+    let active_bonded = Fixed::from_raw(witness.entropy_stats.active_bonded_magnitude_raw)?;
+    let total_supply  = Fixed::from_raw(witness.entropy_stats.total_supply_raw)?;
+    let entropy = compute_entropy(
+        active_bonded,
+        total_supply,
+        witness.entropy_stats.unique_active_validators,
+        witness.entropy_stats.optimal_validator_count,
+    )?;
+    let new_entropy_metric_scaled = entropy.raw();
+
+    // ── Step 9: VDF challenge seed ────────────────────────────────────────────
+    // STUB: Real seed is un-biasable VDF output (deferred to v0.1.0).
+    let new_vdf_challenge_seed: Digest = [0u8; 32];
+
+    // ── Step 10: Assemble and commit ──────────────────────────────────────────
+    // commit() = canonicalize() → sha256() → assign state_root → Ok(self).
+    // ALL pool mutations committed atomically: if commit() fails, nothing is written.
+    let new_state = EpochState {
+        bond_pool_root:        new_bond_pool_root,
+        entropy_metric_scaled: new_entropy_metric_scaled,
+        epoch_number:          new_epoch_number,
+        impact_pool_root:      new_impact_pool_root,
+        kernel_hash,
+        previous_root:         new_previous_root,
+        state_root:            [0u8; 32], // overwritten by commit()
         validator_set_root:    new_validator_set_root,
         vdf_challenge_seed:    new_vdf_challenge_seed,
     };
@@ -366,5 +488,196 @@ mod tests {
             0x6f, 0xae, 0x6a, 0x42, 0x72, 0xb3, 0x57, 0x99,
         ];
         assert_eq!(state.state_root, expected, "epoch 100 chain diverged — execution drift detected");
+    }
+
+    // ── apply_epoch (v0.0.2) ──────────────────────────────────────────────────
+
+    use crate::state::witness::{
+        EntropyStats, LeafMutation, MerklePath, MerklePathNode, NodePosition,
+        StateWitnessBundle, apply_pool_mutations,
+    };
+    use crate::physics::hashing::{hash_leaf, hash_node};
+    use crate::physics::merkle::empty_tree_root;
+
+    /// Standard entropy stats for tests: 50% bonded, 50% participation → entropy = 0.25
+    fn test_entropy() -> EntropyStats {
+        // total_supply = Fixed(1) = raw 1_000_000_000_000
+        // active_bonded = Fixed(0.5) = raw 500_000_000_000
+        // unique_active = 5, optimal = 10
+        // entropy = (0.5) * (5/10) = 0.25 = raw 250_000_000_000
+        EntropyStats {
+            active_bonded_magnitude_raw: 500_000_000_000_u128,
+            total_supply_raw:            1_000_000_000_000_u128,
+            unique_active_validators:    5,
+            optimal_validator_count:     10,
+        }
+    }
+
+    /// Build a single-level LeafMutation (two-leaf tree at genesis-like roots).
+    fn epoch_mutation(
+        key: &[u8],
+        old_raw: &[u8],
+        new_raw: &[u8],
+        sibling: [u8; 32],
+        position: NodePosition,
+    ) -> LeafMutation {
+        LeafMutation {
+            key: key.to_vec(),
+            old_value: old_raw.to_vec(),
+            new_value: new_raw.to_vec(),
+            path: MerklePath::new(vec![MerklePathNode { sibling, position }]).unwrap(),
+        }
+    }
+
+    #[test]
+    fn apply_epoch_empty_bundle_advances_epoch_and_preserves_roots() {
+        // apply_epoch with all-empty witness vectors must:
+        // - increment epoch_number by 1
+        // - preserve all three pool roots unchanged
+        // - chain previous_root correctly
+        let genesis = zero_genesis();
+        let witness = StateWitnessBundle {
+            bond_witnesses:     vec![],
+            entropy_stats:      test_entropy(),
+            impact_witnesses:   vec![],
+            validator_witnesses: vec![],
+        };
+
+        let next = apply_epoch(&genesis, &witness, [0u8; 32]).unwrap();
+
+        assert_eq!(next.epoch_number, 1, "epoch_number must increment");
+        assert_eq!(next.previous_root, genesis.state_root, "must chain state root");
+        assert_eq!(next.validator_set_root, genesis.validator_set_root, "validator pool must be unchanged");
+        assert_eq!(next.impact_pool_root,   genesis.impact_pool_root,   "impact pool must be unchanged");
+        assert_eq!(next.bond_pool_root,     genesis.bond_pool_root,     "bond pool must be unchanged");
+        assert_ne!(next.state_root, genesis.state_root, "state_root must change (epoch advanced)");
+        assert_ne!(next.entropy_metric_scaled, 0, "entropy must be non-zero");
+    }
+
+    #[test]
+    fn apply_epoch_multi_pool_updates_correct_roots() {
+        // Tree layout:
+        //   validator_set_root = hash_node(hash_leaf("v1"), hash_leaf("v2"))
+        //   impact_pool_root   = hash_leaf("i1")   (single leaf = no path)
+        //   bond_pool_root     = genesis all-zeros  (no bond mutations)
+        let leaf_v1 = hash_leaf(b"v1");
+        let leaf_v2 = hash_leaf(b"v2");
+        let leaf_i1 = hash_leaf(b"i1");
+
+        let initial_validator_root = hash_node(&leaf_v1, &leaf_v2);
+        let initial_impact_root    = leaf_i1; // single-leaf: root IS the hash
+
+        let mut initial_state = zero_genesis();
+        initial_state.validator_set_root = initial_validator_root;
+        initial_state.impact_pool_root   = initial_impact_root;
+        // Re-commit to get correct state_root.
+        let initial_state = initial_state.commit().unwrap();
+
+        // Validator mutation: v1 → v1_updated (v1 is LEFT child)
+        let v_mutation = epoch_mutation(b"v1", b"v1", b"v1_updated", leaf_v2, NodePosition::Left);
+        // Impact mutation: i1 → i1_updated (single leaf, empty path)
+        let i_mutation = LeafMutation {
+            key: b"i1".to_vec(),
+            old_value: b"i1".to_vec(),
+            new_value: b"i1_updated".to_vec(),
+            path: MerklePath::new(vec![]).unwrap(),
+        };
+
+        let witness = StateWitnessBundle {
+            bond_witnesses:      vec![],
+            entropy_stats:       test_entropy(),
+            impact_witnesses:    vec![i_mutation],
+            validator_witnesses: vec![v_mutation],
+        };
+
+        let next = apply_epoch(&initial_state, &witness, [0u8; 32]).unwrap();
+
+        // Validator root must change.
+        let expected_validator_root = hash_node(&hash_leaf(b"v1_updated"), &leaf_v2);
+        assert_eq!(next.validator_set_root, expected_validator_root,
+            "validator_set_root must reflect mutation");
+
+        // Impact root must change (single-leaf tree → new leaf hash).
+        let expected_impact_root = hash_leaf(b"i1_updated");
+        assert_eq!(next.impact_pool_root, expected_impact_root,
+            "impact_pool_root must reflect mutation");
+
+        // Bond root must be unchanged (no bond witnesses).
+        assert_eq!(next.bond_pool_root, initial_state.bond_pool_root,
+            "bond_pool_root must be unchanged when no bond witnesses provided");
+
+        // Entropy must be computed (non-zero, not passthrough from prev).
+        assert_ne!(next.entropy_metric_scaled, initial_state.entropy_metric_scaled,
+            "entropy must be freshly computed, not passed through");
+
+        // PINNED CONSTITUTIONAL VECTOR — DO NOT CHANGE.
+        // Two-pool mutation epoch (validator v1→v1_updated, impact i1→i1_updated,
+        // bond unchanged, entropy 50%×50%=25%, kernel_hash=[0;32]).
+        // Final state_root = SHA256(canonical JSON of new EpochState).
+        // Any change to apply_epoch, apply_pool_mutations, compute_entropy,
+        // or EpochState serialization will break this assertion immediately.
+        let expected_state_root: [u8; 32] = [
+            0x20, 0xba, 0x16, 0x51, 0x8a, 0xac, 0xb1, 0x90,
+            0xc4, 0x6c, 0x10, 0xd0, 0xcf, 0xbd, 0x19, 0xd1,
+            0xf5, 0xe4, 0x6e, 0x4d, 0xf0, 0x81, 0x7b, 0xfd,
+            0x18, 0x5d, 0xd9, 0xc6, 0x2c, 0xeb, 0x2b, 0x0b,
+        ];
+        assert_eq!(next.state_root, expected_state_root,
+            "multi-pool epoch state_root diverged — apply_epoch execution path changed");
+    }
+
+    #[test]
+    fn apply_epoch_corrupt_validator_path_fails_entire_epoch() {
+        // A bad path in validator_witnesses must abort the entire epoch.
+        // bond_pool_root and impact_pool_root must NOT be updated.
+        let leaf_v1 = hash_leaf(b"v1");
+        let leaf_v2 = hash_leaf(b"v2");
+        let initial_validator_root = hash_node(&leaf_v1, &leaf_v2);
+        let mut state = zero_genesis();
+        state.validator_set_root = initial_validator_root;
+        let state = state.commit().unwrap();
+
+        // Wrong sibling → path will not verify.
+        let bad_mutation = epoch_mutation(
+            b"v1", b"v1", b"v1_updated",
+            hash_leaf(b"WRONG_SIBLING"), // corrupted
+            NodePosition::Left,
+        );
+
+        let witness = StateWitnessBundle {
+            bond_witnesses:      vec![],
+            entropy_stats:       test_entropy(),
+            impact_witnesses:    vec![],
+            validator_witnesses: vec![bad_mutation],
+        };
+
+        assert_eq!(
+            apply_epoch(&state, &witness, [0u8; 32]),
+            Err(TransitionError::InvalidMerkleWitness),
+            "corrupt validator path must fail the entire epoch"
+        );
+    }
+
+    #[test]
+    fn apply_epoch_corrupt_entropy_fails_before_any_pool_mutation() {
+        // Entropy validation happens BEFORE pools are touched.
+        // A corrupt entropy must abort before any Merkle root changes.
+        let witness = StateWitnessBundle {
+            bond_witnesses:      vec![],
+            entropy_stats:       EntropyStats {
+                active_bonded_magnitude_raw: 2_000_000_000_000_u128, // > total_supply
+                total_supply_raw:            1_000_000_000_000_u128,
+                unique_active_validators:    5,
+                optimal_validator_count:     10,
+            },
+            impact_witnesses:    vec![],
+            validator_witnesses: vec![],
+        };
+
+        assert_eq!(
+            apply_epoch(&zero_genesis(), &witness, [0u8; 32]),
+            Err(TransitionError::MathOverflow),
+            "bonded > supply must fail before any pool mutation"
+        );
     }
 }
