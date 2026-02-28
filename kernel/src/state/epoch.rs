@@ -284,7 +284,7 @@ mod tests {
     #[test]
     fn state_root_excluded_from_its_own_serialization() {
         // Changing state_root must NOT change the canonical bytes (no self-reference).
-        let mut a = EpochState {
+        let a = EpochState {
             bond_pool_root:        [0u8; 32],
             entropy_metric_scaled: 0,
             epoch_number:          0,

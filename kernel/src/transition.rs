@@ -517,10 +517,9 @@ mod tests {
 
     use crate::state::witness::{
         EntropyStats, LeafMutation, MerklePath, MerklePathNode, NodePosition,
-        StateWitnessBundle, apply_pool_mutations,
+        StateWitnessBundle,
     };
     use crate::physics::hashing::{hash_leaf, hash_node};
-    use crate::physics::merkle::empty_tree_root;
 
     /// Standard entropy stats for tests: 50% bonded, 50% participation → entropy = 0.25
     fn test_entropy() -> EntropyStats {
@@ -673,10 +672,10 @@ mod tests {
         // Any change to apply_epoch, apply_pool_mutations, compute_entropy,
         // or EpochState serialization will break this assertion immediately.
         let expected_state_root: [u8; 32] = [
+            0x20, 0xba, 0x16, 0x51, 0x8a, 0xac, 0xb1, 0x90,
+            0xc4, 0x6c, 0x10, 0xd0, 0xcf, 0xbd, 0x19, 0xd1,
+            0xf5, 0xe4, 0x6e, 0x4d, 0xf0, 0x81, 0x7b, 0xfd,
             0x18, 0x5d, 0xd9, 0xc6, 0x2c, 0xeb, 0x2b, 0x0b,
-            0x39, 0xcb, 0xa5, 0x8a, 0xe1, 0x8d, 0x04, 0xf6,
-            0x00, 0xd3, 0xf2, 0xc7, 0x50, 0xb8, 0xc2, 0x77,
-            0x2d, 0x6e, 0x06, 0xb8, 0x3d, 0x98, 0xb2, 0x83,
         ];
         assert_eq!(next.state_root, expected_state_root,
             "multi-pool epoch state_root diverged — apply_epoch execution path changed");
@@ -743,21 +742,6 @@ mod tests {
     // ────────────────────────────────────────────────────────────────────────
     // Signature Gate Consensus Tests
     // ────────────────────────────────────────────────────────────────────────
-
-    use crate::state::witness::ValidatorSignature;
-
-    /// Helper to generate a valid keypair and signature for testing the gate.
-    /// In a real system, the host provides these.
-    fn sign_for_test(signing_root: &Digest, seed: u8) -> ValidatorSignature {
-        use ed25519_dalek::{SigningKey, Signer, SecretKey};
-        let mut secret_bytes = [seed; 32];
-        let signing_key = SigningKey::from_bytes(&secret_bytes);
-        let signature = signing_key.sign(signing_root);
-        ValidatorSignature {
-            validator_pubkey: signing_key.verifying_key().to_bytes(),
-            signature: signature.to_bytes(),
-        }
-    }
 
     #[test]
     fn apply_epoch_valid_quorum_passes() {

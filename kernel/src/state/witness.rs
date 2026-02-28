@@ -823,7 +823,7 @@ mod tests {
 
         let original_root = hash_node(&leaf_a, &leaf_b);
         // After mutation 1: intermediate = hash_node(A2, B)
-        let intermediate  = hash_node(&leaf_a2, &leaf_b);
+        hash_node(&leaf_a2, &leaf_b);
 
         // Mutation 1: A → A2, path relative to original_root.
         let m1 = make_mutation(b"a", b"a", b"a2", leaf_b, NodePosition::Left);
