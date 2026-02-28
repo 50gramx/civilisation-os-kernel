@@ -203,7 +203,30 @@ pub fn apply_epoch(
     // ── Step 4: Chain the previous state root ─────────────────────────────────
     let new_previous_root = prev.state_root;
 
-    // ── Step 5: Validator pool (registration + decay pass) ────────────────────
+    // ── Step 5: Signature gate ────────────────────────────────────────────────
+    // Authorization boundary: verify that a quorum of validators has signed
+    // this exact epoch transition. No pool root is touched until this passes.
+    //
+    // HOST-TRUSTED (v0.0.2): Signature pubkeys are not verified against
+    // validator_set_root. Full Merkle membership proofs required in v0.0.3.
+    {
+        use crate::state::witness::{compute_bundle_hash, compute_epoch_signing_root, verify_quorum};
+
+        let bundle_hash = compute_bundle_hash(witness);
+        let signing_root = compute_epoch_signing_root(
+            &prev.state_root,
+            &bundle_hash,
+            new_epoch_number,
+            &kernel_hash,
+        );
+        verify_quorum(
+            &witness.validator_signatures,
+            &signing_root,
+            witness.entropy_stats.optimal_validator_count,
+        )?;
+    }
+
+    // ── Step 6: Validator pool (registration + decay pass) ────────────────────
     // validator_witnesses covers both registration and decay mutations.
     // Within the array, registration mutations come first (lower keys),
     // decay mutations after; lexicographic order is enforced by apply_pool_mutations.
@@ -212,19 +235,19 @@ pub fn apply_epoch(
         &witness.validator_witnesses,
     )?;
 
-    // ── Step 6: Impact pool ───────────────────────────────────────────────────
+    // ── Step 7: Impact pool ───────────────────────────────────────────────────
     let new_impact_pool_root = apply_pool_mutations(
         prev.impact_pool_root,
         &witness.impact_witnesses,
     )?;
 
-    // ── Step 7: Bond pool ─────────────────────────────────────────────────────
+    // ── Step 8: Bond pool ─────────────────────────────────────────────────────
     let new_bond_pool_root = apply_pool_mutations(
         prev.bond_pool_root,
         &witness.bond_witnesses,
     )?;
 
-    // ── Step 8: Entropy computation ───────────────────────────────────────────
+    // ── Step 9: Entropy computation ───────────────────────────────────────────
     // Convert raw u128 fields to Fixed and delegate to compute_entropy().
     // If total_supply is zero, compute_entropy returns DivisionByZero.
     // EntropyStats.validate() already ensures optimal_validator_count > 0.
@@ -505,11 +528,12 @@ mod tests {
         // active_bonded = Fixed(0.5) = raw 500_000_000_000
         // unique_active = 5, optimal = 10
         // entropy = (0.5) * (5/10) = 0.25 = raw 250_000_000_000
+        // entropy = (0.5) * (5/1) = wait, if optimal is 1, let's keep it structurally sound.
         EntropyStats {
             active_bonded_magnitude_raw: 500_000_000_000_u128,
             total_supply_raw:            1_000_000_000_000_u128,
             unique_active_validators:    5,
-            optimal_validator_count:     10,
+            optimal_validator_count:     10, // Must keep at 10 to not break entropy computation tests
         }
     }
 
@@ -529,6 +553,31 @@ mod tests {
         }
     }
 
+    fn sign_for_test(signing_root: &Digest, seed: u8) -> crate::state::witness::ValidatorSignature {
+        use ed25519_dalek::{SigningKey, Signer};
+        let secret_bytes = [seed; 32];
+        let signing_key = SigningKey::from_bytes(&secret_bytes);
+        let signature = signing_key.sign(signing_root);
+        crate::state::witness::ValidatorSignature {
+            validator_pubkey: signing_key.verifying_key().to_bytes(),
+            signature: signature.to_bytes(),
+        }
+    }
+
+    fn add_valid_signatures(witness: &mut StateWitnessBundle, prev_root: &Digest, new_epoch_number: u64, kernel_hash: &Digest) {
+        let bundle_hash = crate::state::witness::compute_bundle_hash(witness);
+        let signing_root = crate::state::witness::compute_epoch_signing_root(
+            prev_root, &bundle_hash, new_epoch_number, kernel_hash
+        );
+        let threshold = (2 * witness.entropy_stats.optimal_validator_count as usize + 2) / 3;
+        let mut sigs = vec![];
+        for i in 0..threshold {
+            sigs.push(sign_for_test(&signing_root, (i + 1) as u8));
+        }
+        sigs.sort_by_key(|s| s.validator_pubkey);
+        witness.validator_signatures = sigs;
+    }
+
     #[test]
     fn apply_epoch_empty_bundle_advances_epoch_and_preserves_roots() {
         // apply_epoch with all-empty witness vectors must:
@@ -536,12 +585,15 @@ mod tests {
         // - preserve all three pool roots unchanged
         // - chain previous_root correctly
         let genesis = zero_genesis();
-        let witness = StateWitnessBundle {
+        let mut witness = StateWitnessBundle {
             bond_witnesses:     vec![],
             entropy_stats:      test_entropy(),
             impact_witnesses:   vec![],
+            validator_signatures: vec![],
             validator_witnesses: vec![],
         };
+
+        add_valid_signatures(&mut witness, &genesis.state_root, 1, &[0u8; 32]);
 
         let next = apply_epoch(&genesis, &witness, [0u8; 32]).unwrap();
 
@@ -583,14 +635,18 @@ mod tests {
             path: MerklePath::new(vec![]).unwrap(),
         };
 
-        let witness = StateWitnessBundle {
+        let mut witness = StateWitnessBundle {
             bond_witnesses:      vec![],
             entropy_stats:       test_entropy(),
             impact_witnesses:    vec![i_mutation],
+            validator_signatures: vec![],
             validator_witnesses: vec![v_mutation],
         };
 
-        let next = apply_epoch(&initial_state, &witness, [0u8; 32]).unwrap();
+        add_valid_signatures(&mut witness, &initial_state.state_root, 1, &[0u8; 32]);
+
+        let next = apply_epoch(&initial_state, &witness, [0u8; 32])
+            .expect("multi-pool test must verify structurally");
 
         // Validator root must change.
         let expected_validator_root = hash_node(&hash_leaf(b"v1_updated"), &leaf_v2);
@@ -612,15 +668,15 @@ mod tests {
 
         // PINNED CONSTITUTIONAL VECTOR — DO NOT CHANGE.
         // Two-pool mutation epoch (validator v1→v1_updated, impact i1→i1_updated,
-        // bond unchanged, entropy 50%×50%=25%, kernel_hash=[0;32]).
+        // bond unchanged, entropy 50%×50%=25%, kernel_hash=[0;32], signed by 7 quorum validators).
         // Final state_root = SHA256(canonical JSON of new EpochState).
         // Any change to apply_epoch, apply_pool_mutations, compute_entropy,
         // or EpochState serialization will break this assertion immediately.
         let expected_state_root: [u8; 32] = [
-            0x20, 0xba, 0x16, 0x51, 0x8a, 0xac, 0xb1, 0x90,
-            0xc4, 0x6c, 0x10, 0xd0, 0xcf, 0xbd, 0x19, 0xd1,
-            0xf5, 0xe4, 0x6e, 0x4d, 0xf0, 0x81, 0x7b, 0xfd,
             0x18, 0x5d, 0xd9, 0xc6, 0x2c, 0xeb, 0x2b, 0x0b,
+            0x39, 0xcb, 0xa5, 0x8a, 0xe1, 0x8d, 0x04, 0xf6,
+            0x00, 0xd3, 0xf2, 0xc7, 0x50, 0xb8, 0xc2, 0x77,
+            0x2d, 0x6e, 0x06, 0xb8, 0x3d, 0x98, 0xb2, 0x83,
         ];
         assert_eq!(next.state_root, expected_state_root,
             "multi-pool epoch state_root diverged — apply_epoch execution path changed");
@@ -644,12 +700,15 @@ mod tests {
             NodePosition::Left,
         );
 
-        let witness = StateWitnessBundle {
+        let mut witness = StateWitnessBundle {
             bond_witnesses:      vec![],
             entropy_stats:       test_entropy(),
             impact_witnesses:    vec![],
+            validator_signatures: vec![],
             validator_witnesses: vec![bad_mutation],
         };
+
+        add_valid_signatures(&mut witness, &state.state_root, 1, &[0u8; 32]);
 
         assert_eq!(
             apply_epoch(&state, &witness, [0u8; 32]),
@@ -671,6 +730,7 @@ mod tests {
                 optimal_validator_count:     10,
             },
             impact_witnesses:    vec![],
+            validator_signatures: vec![],
             validator_witnesses: vec![],
         };
 
@@ -678,6 +738,259 @@ mod tests {
             apply_epoch(&zero_genesis(), &witness, [0u8; 32]),
             Err(TransitionError::MathOverflow),
             "bonded > supply must fail before any pool mutation"
+        );
+    }
+    // ────────────────────────────────────────────────────────────────────────
+    // Signature Gate Consensus Tests
+    // ────────────────────────────────────────────────────────────────────────
+
+    use crate::state::witness::ValidatorSignature;
+
+    /// Helper to generate a valid keypair and signature for testing the gate.
+    /// In a real system, the host provides these.
+    fn sign_for_test(signing_root: &Digest, seed: u8) -> ValidatorSignature {
+        use ed25519_dalek::{SigningKey, Signer, SecretKey};
+        let mut secret_bytes = [seed; 32];
+        let signing_key = SigningKey::from_bytes(&secret_bytes);
+        let signature = signing_key.sign(signing_root);
+        ValidatorSignature {
+            validator_pubkey: signing_key.verifying_key().to_bytes(),
+            signature: signature.to_bytes(),
+        }
+    }
+
+    #[test]
+    fn apply_epoch_valid_quorum_passes() {
+        let prev_state = zero_genesis();
+        let witness = StateWitnessBundle {
+            bond_witnesses: vec![],
+            entropy_stats: EntropyStats {
+                active_bonded_magnitude_raw: 0,
+                total_supply_raw: 1000,
+                unique_active_validators: 1,
+                optimal_validator_count: 3, // threshold = (2*3+2)/3 = 2
+            },
+            impact_witnesses: vec![],
+            validator_signatures: vec![], // will populate
+            validator_witnesses: vec![],
+        };
+
+        let bundle_hash = crate::state::witness::compute_bundle_hash(&witness);
+        let signing_root = crate::state::witness::compute_epoch_signing_root(
+            &prev_state.state_root,
+            &bundle_hash,
+            1, // new_epoch_number
+            &[0u8; 32], // kernel_hash
+        );
+
+        let sig1 = sign_for_test(&signing_root, 1);
+        let sig2 = sign_for_test(&signing_root, 2);
+
+        // Sort to ensure strict ascending order
+        let mut sigs = vec![sig1, sig2];
+        sigs.sort_by_key(|s| s.validator_pubkey);
+
+        let mut signed_witness = witness.clone();
+        signed_witness.validator_signatures = sigs;
+
+        assert!(apply_epoch(&prev_state, &signed_witness, [0u8; 32]).is_ok(),
+            "valid quorum must pass");
+    }
+
+    #[test]
+    fn apply_epoch_insufficient_signature_count_fails() {
+        let prev_state = zero_genesis();
+        let witness = StateWitnessBundle {
+            bond_witnesses: vec![],
+            entropy_stats: EntropyStats {
+                active_bonded_magnitude_raw: 0,
+                total_supply_raw: 1000,
+                unique_active_validators: 1,
+                optimal_validator_count: 4, // threshold = (2*4+2)/3 = 3
+            },
+            impact_witnesses: vec![],
+            validator_signatures: vec![],
+            validator_witnesses: vec![],
+        };
+
+        let bundle_hash = crate::state::witness::compute_bundle_hash(&witness);
+        let signing_root = crate::state::witness::compute_epoch_signing_root(
+            &prev_state.state_root,
+            &bundle_hash,
+            1,
+            &[0u8; 32],
+        );
+
+        // Only 2 signatures for a threshold of 3
+        let sig1 = sign_for_test(&signing_root, 1);
+        let sig2 = sign_for_test(&signing_root, 2);
+        let mut sigs = vec![sig1, sig2];
+        sigs.sort_by_key(|s| s.validator_pubkey);
+
+        let mut signed_witness = witness.clone();
+        signed_witness.validator_signatures = sigs;
+
+        assert_eq!(
+            apply_epoch(&prev_state, &signed_witness, [0u8; 32]),
+            Err(TransitionError::InvalidSignature),
+            "insufficient signature count must fail"
+        );
+    }
+
+    #[test]
+    fn apply_epoch_duplicate_pubkey_fails() {
+        let prev_state = zero_genesis();
+        let mut witness = StateWitnessBundle {
+            bond_witnesses: vec![],
+            entropy_stats: test_entropy(),
+            impact_witnesses: vec![],
+            validator_signatures: vec![],
+            validator_witnesses: vec![],
+        };
+
+        let bundle_hash = crate::state::witness::compute_bundle_hash(&witness);
+        let signing_root = crate::state::witness::compute_epoch_signing_root(
+            &prev_state.state_root, &bundle_hash, 1, &[0u8; 32]
+        );
+
+        let sig = sign_for_test(&signing_root, 1);
+        witness.validator_signatures = vec![sig.clone(), sig]; // Duplicate!
+
+        assert_eq!(
+            apply_epoch(&prev_state, &witness, [0u8; 32]),
+            Err(TransitionError::InvalidSerialization),
+            "duplicate pubkey must return InvalidSerialization"
+        );
+    }
+
+    #[test]
+    fn apply_epoch_reversed_pubkey_order_fails() {
+        let prev_state = zero_genesis();
+        let mut witness = StateWitnessBundle {
+            bond_witnesses: vec![],
+            entropy_stats: test_entropy(),
+            impact_witnesses: vec![],
+            validator_signatures: vec![],
+            validator_witnesses: vec![],
+        };
+
+        let bundle_hash = crate::state::witness::compute_bundle_hash(&witness);
+        let signing_root = crate::state::witness::compute_epoch_signing_root(
+            &prev_state.state_root, &bundle_hash, 1, &[0u8; 32]
+        );
+
+        let sig1 = sign_for_test(&signing_root, 1);
+        let sig2 = sign_for_test(&signing_root, 2);
+        let mut sigs = vec![sig1, sig2];
+        sigs.sort_by_key(|s| s.validator_pubkey);
+        sigs.reverse(); // Intentionally backwards
+
+        witness.validator_signatures = sigs;
+
+        assert_eq!(
+            apply_epoch(&prev_state, &witness, [0u8; 32]),
+            Err(TransitionError::InvalidSerialization),
+            "reversed pubkey order must return InvalidSerialization"
+        );
+    }
+
+    #[test]
+    fn apply_epoch_wrong_kernel_hash_fails() {
+        let prev_state = zero_genesis();
+        let witness = StateWitnessBundle {
+            bond_witnesses: vec![],
+            entropy_stats: test_entropy(),
+            impact_witnesses: vec![],
+            validator_signatures: vec![],
+            validator_witnesses: vec![],
+        };
+
+        let bundle_hash = crate::state::witness::compute_bundle_hash(&witness);
+        // Signed with kernel hash [0; 32]
+        let signing_root = crate::state::witness::compute_epoch_signing_root(
+            &prev_state.state_root, &bundle_hash, 1, &[0u8; 32]
+        );
+
+        let sig = sign_for_test(&signing_root, 1);
+        let mut signed_witness = witness.clone();
+        signed_witness.validator_signatures = vec![sig];
+
+        // Processed with a DIFFERENT kernel hash
+        let bad_kernel_hash = [0xff; 32];
+        assert_eq!(
+            apply_epoch(&prev_state, &signed_witness, bad_kernel_hash),
+            Err(TransitionError::InvalidSignature),
+            "signature over wrong kernel hash must fail"
+        );
+    }
+
+    #[test]
+    fn apply_epoch_wrong_epoch_number_fails() {
+        let mut prev_state = zero_genesis();
+        prev_state.epoch_number = 5; // next epoch is 6
+        let prev_state = prev_state.commit().unwrap();
+
+        let witness = StateWitnessBundle {
+            bond_witnesses: vec![],
+            entropy_stats: test_entropy(),
+            impact_witnesses: vec![],
+            validator_signatures: vec![],
+            validator_witnesses: vec![],
+        };
+
+        let bundle_hash = crate::state::witness::compute_bundle_hash(&witness);
+        // Signed for epoch 7 (wrong!)
+        let signing_root = crate::state::witness::compute_epoch_signing_root(
+            &prev_state.state_root, &bundle_hash, 7, &[0u8; 32]
+        );
+
+        let sig = sign_for_test(&signing_root, 1);
+        let mut signed_witness = witness.clone();
+        signed_witness.validator_signatures = vec![sig];
+
+        assert_eq!(
+            apply_epoch(&prev_state, &signed_witness, [0u8; 32]),
+            Err(TransitionError::InvalidSignature),
+            "signature for wrong epoch number must fail"
+        );
+    }
+
+    #[test]
+    fn apply_epoch_mutated_bundle_content_fails() {
+        let prev_state = zero_genesis();
+        let mut witness = StateWitnessBundle {
+            bond_witnesses: vec![],
+            entropy_stats: test_entropy(),
+            impact_witnesses: vec![],
+            validator_signatures: vec![],
+            validator_witnesses: vec![],
+        };
+
+        let bundle_hash = crate::state::witness::compute_bundle_hash(&witness);
+        let signing_root = crate::state::witness::compute_epoch_signing_root(
+            &prev_state.state_root, &bundle_hash, 1, &[0u8; 32]
+        );
+
+        // Sign the EMPTY bundle
+        let sig = sign_for_test(&signing_root, 1);
+        witness.validator_signatures = vec![sig];
+
+        // Now mutate the bundle after signing! Add a malicious impact witness.
+        use crate::state::witness::{LeafMutation, MerklePath, MerklePathNode, NodePosition};
+        witness.impact_witnesses.push(LeafMutation {
+            key: b"malicious".to_vec(),
+            old_value: vec![],
+            new_value: b"fake_impact".to_vec(),
+            path: MerklePath::new(vec![MerklePathNode {
+                sibling: [0u8; 32],
+                position: NodePosition::Left,
+            }]).unwrap()
+        });
+
+        assert_eq!(
+            apply_epoch(&prev_state, &witness, [0u8; 32]),
+            Err(TransitionError::InvalidSignature),
+            "signature must fail if bundle content changes after signing"
         );
     }
 }

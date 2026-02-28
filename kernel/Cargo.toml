@@ -13,8 +13,17 @@ repository = "https://github.com/50gramx/civilisation-os-kernel"
 crate-type = ["rlib"]
 
 [dependencies]
-# Zero external dependencies. All cryptographic primitives implemented inline.
-# Supply chain is fully auditable within this repository alone.
+# Ed25519 signature verification — the ONLY external dependency.
+# Vendored from dalek-cryptography. Pinned exact version. default-features=false
+# for no_std + WASM compatibility. Verification-only (no signing in consensus).
+#
+# WHY EXTERNAL: Custom Ed25519 produced four consensus-fork-class bugs before
+# test vectors could even finish. Crypto must be predictable infrastructure,
+# not original code. See: ed25519_gate_plan.md for architectural rationale.
+#
+# AUDIT SURFACE: ed25519-dalek is the most widely used Ed25519 in Rust.
+# curve25519-dalek uses proven 5×51-bit radix field arithmetic.
+ed25519-dalek = { version = "=2.1.1", default-features = false }
 
 [dev-dependencies]
 # Test harness only — std is permitted behind cfg(test).

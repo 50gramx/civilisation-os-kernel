@@ -26,7 +26,7 @@
 //!   roots. Model B (paths relative to original root) is rejected.
 
 use crate::TransitionError;
-use crate::physics::hashing::{Digest, hash_leaf, hash_node};
+use crate::physics::hashing::{Digest, sha256, hash_leaf, hash_node};
 use crate::physics::merkle::MAX_MERKLE_DEPTH;
 use crate::state::epoch::MAX_PAYLOADS_PER_EPOCH;
 
@@ -222,6 +222,26 @@ impl EntropyStats {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// ValidatorSignature
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Maximum number of validator signatures per epoch.
+/// Matches `MAX_PAYLOADS_PER_EPOCH` — no epoch can have more signers than payloads.
+pub const MAX_VALIDATOR_SIGNATURES: usize = MAX_PAYLOADS_PER_EPOCH;
+
+/// A single Ed25519 signature from a validator authorizing this epoch transition.
+///
+/// Within `StateWitnessBundle.validator_signatures`, entries MUST be in strictly
+/// ascending order of `validator_pubkey`. No duplicate pubkeys are permitted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatorSignature {
+    /// Ed25519 public key (32 bytes, compressed Edwards y-coordinate + sign bit).
+    pub validator_pubkey: [u8; 32],
+    /// Ed25519 signature (64 bytes: R || s).
+    pub signature: [u8; 64],
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // StateWitnessBundle
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -242,6 +262,11 @@ pub struct StateWitnessBundle {
     pub entropy_stats: EntropyStats,
     /// Witness mutations for the impact pool tree (`EpochState.impact_pool_root`).
     pub impact_witnesses: Vec<LeafMutation>,
+    /// Ed25519 signatures authorizing this epoch transition.
+    /// Strictly ascending pubkey order, no duplicates.
+    /// HOST-TRUSTED (v0.0.2): Pubkeys are NOT verified against validator_set_root.
+    /// Full Merkle membership proofs required in v0.0.3.
+    pub validator_signatures: Vec<ValidatorSignature>,
     /// Witness mutations for the validator set tree (`EpochState.validator_set_root`).
     /// Processed in two passes: registration first, then decay.
     pub validator_witnesses: Vec<LeafMutation>,
@@ -257,8 +282,133 @@ impl StateWitnessBundle {
         if total > MAX_PAYLOADS_PER_EPOCH {
             return Err(TransitionError::PayloadLimitExceeded);
         }
+        if self.validator_signatures.len() > MAX_VALIDATOR_SIGNATURES {
+            return Err(TransitionError::PayloadLimitExceeded);
+        }
         Ok(())
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Signature Gate Functions
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Domain separation prefix for epoch signing root (distinct from leaf=0x00, node=0x01).
+const SIGNING_DOMAIN_PREFIX: u8 = 0x02;
+
+/// Compute the canonical hash of all three mutation vectors.
+///
+/// Format (frozen — any change forks the protocol):
+/// ```text
+/// len(bond_witnesses)_be4 || bond_bytes ||
+/// len(impact_witnesses)_be4 || impact_bytes ||
+/// len(validator_witnesses)_be4 || validator_bytes
+/// ```
+///
+/// Where each mutation is serialized as:
+/// ```text
+/// len(key)_be2 || key || len(old_value)_be2 || old_value || len(new_value)_be2 || new_value
+/// ```
+///
+/// Path data is NOT included — paths are structural, not content.
+pub fn compute_bundle_hash(witness: &StateWitnessBundle) -> Digest {
+    let mut buf = Vec::new();
+    serialize_mutations(&mut buf, &witness.bond_witnesses);
+    serialize_mutations(&mut buf, &witness.impact_witnesses);
+    serialize_mutations(&mut buf, &witness.validator_witnesses);
+    sha256(&buf)
+}
+
+/// Serialize a mutation vector in canonical format.
+fn serialize_mutations(buf: &mut Vec<u8>, mutations: &[LeafMutation]) {
+    // 4-byte big-endian count (max 10,000 fits in u32).
+    buf.extend_from_slice(&(mutations.len() as u32).to_be_bytes());
+    for m in mutations {
+        // key: 2-byte len + bytes
+        buf.extend_from_slice(&(m.key.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&m.key);
+        // old_value: 2-byte len + bytes
+        buf.extend_from_slice(&(m.old_value.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&m.old_value);
+        // new_value: 2-byte len + bytes
+        buf.extend_from_slice(&(m.new_value.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&m.new_value);
+    }
+}
+
+/// Compute the epoch signing root — the digest that validators sign.
+///
+/// ```text
+/// SHA256(0x02 || prev_state_root || bundle_hash || epoch_number_be8 || kernel_hash)
+/// ```
+///
+/// - `0x02`: domain separation (leaf=0x00, node=0x01, signing=0x02)
+/// - `prev_state_root`: binds history
+/// - `bundle_hash`: binds all witness content
+/// - `epoch_number_be8`: prevents replay
+/// - `kernel_hash`: binds protocol version
+///
+/// Total input: 1 + 32 + 32 + 8 + 32 = 105 bytes.
+pub fn compute_epoch_signing_root(
+    prev_state_root: &Digest,
+    bundle_hash: &Digest,
+    epoch_number: u64,
+    kernel_hash: &Digest,
+) -> Digest {
+    let mut buf = [0u8; 105];
+    buf[0] = SIGNING_DOMAIN_PREFIX;
+    buf[1..33].copy_from_slice(prev_state_root);
+    buf[33..65].copy_from_slice(bundle_hash);
+    buf[65..73].copy_from_slice(&epoch_number.to_be_bytes());
+    buf[73..105].copy_from_slice(kernel_hash);
+    sha256(&buf)
+}
+
+/// Verify quorum: structural checks + cryptographic verification.
+///
+/// Enforces:
+/// 1. Strict ascending pubkey order (no duplicates)
+/// 2. All signatures verify against `signing_root` via `verify_strict`
+/// 3. Count ≥ ⌈2/3 × optimal_validator_count⌉
+///
+/// HOST-TRUSTED (v0.0.2): Pubkeys are NOT verified against validator_set_root.
+/// Full Merkle membership proofs required in v0.0.3.
+///
+/// All signatures are verified before checking threshold — no early exit.
+/// This prevents adversaries from manipulating timing behavior.
+pub fn verify_quorum(
+    signatures: &[ValidatorSignature],
+    signing_root: &Digest,
+    optimal_validator_count: u64,
+) -> Result<(), TransitionError> {
+    use crate::physics::ed25519;
+
+    // ── Step 1: Structural checks ──────────────────────────────────────────
+    // Strict ascending pubkey order, no duplicates.
+    for i in 1..signatures.len() {
+        if signatures[i].validator_pubkey <= signatures[i - 1].validator_pubkey {
+            // Duplicate or reversed order.
+            return Err(TransitionError::InvalidSerialization);
+        }
+    }
+
+    // ── Step 2: Cryptographic verification ──────────────────────────────────
+    // Verify ALL signatures before checking threshold.
+    // No early exit — constant-time traversal prevents timing attacks.
+    for sig in signatures {
+        ed25519::verify(&sig.validator_pubkey, signing_root, &sig.signature)?;
+    }
+
+    // ── Step 3: Threshold check ────────────────────────────────────────────
+    // threshold = ceil(2/3 * n) = (2*n + 2) / 3  (integer math)
+    // Special case: if optimal_validator_count == 0, threshold == 0,
+    // and empty signatures is valid (genesis or no-validator epoch).
+    let threshold = (2 * optimal_validator_count + 2) / 3;
+    if (signatures.len() as u64) < threshold {
+        return Err(TransitionError::InvalidSignature);
+    }
+
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -536,6 +686,7 @@ mod tests {
                 optimal_validator_count: 1,
             },
             impact_witnesses: vec![dummy_mutation; MAX_PAYLOADS_PER_EPOCH / 2 + 1],
+            validator_signatures: vec![],
             validator_witnesses: vec![],
         };
         assert_eq!(bundle.validate_limits(), Err(TransitionError::PayloadLimitExceeded));

@@ -115,7 +115,7 @@ These functions have correct signatures and return explicit errors, but do not y
 | Stub | Status | Target |
 |---|---|---|
 | VDF SNARK proof verification | Returns Ok() in dry_run | v0.0.2 |
-| Ed25519 signature verification | Not called | v0.0.2 |
+| Ed25519 signature verification | Implemented, active gate | v0.0.2 |
 | Per-identity Merkle decay | Roots pass through | v0.0.2 |
 | Entropy recalculation | Passes through | v0.0.2 |
 
